@@ -1,4 +1,4 @@
-# bot.py
+# bot.py (Replit-ready)
 import os
 import datetime
 import pytz
@@ -8,32 +8,53 @@ from dotenv import load_dotenv
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
+# Replit keep-alive tiny web server
+import asyncio
+from aiohttp import web
+
 # ---------- ENV ----------
-load_dotenv()
-DISCORD_TOKEN   = os.getenv("DISCORD_TOKEN")
-SPREADSHEET_ID  = os.getenv("SPREADSHEET_ID")           # use ID, not name
-WORKSHEET_NAME  = os.getenv("WORKSHEET_NAME", "TradingJournal")
-TZNAME          = os.getenv("TZ", "Asia/Makassar")
-GUILD_ID_ENV    = os.getenv("GUILD_ID", "0")
+load_dotenv()  # harmless on Replit; Secrets override
+# Some UIs truncate the left side of DISCORD_TOKEN; this fallback handles "_ORD_TOKEN"
+DISCORD_TOKEN        = os.getenv("DISCORD_TOKEN") or os.getenv("_ORD_TOKEN")
+SPREADSHEET_ID       = os.getenv("SPREADSHEET_ID")
+WORKSHEET_NAME       = os.getenv("WORKSHEET_NAME", "TradingJournal")
+TZNAME               = os.getenv("TZ", "Asia/Makassar")
+GUILD_ID_ENV         = os.getenv("GUILD_ID", "0")
+SERVICE_ACCOUNT_JSON = os.getenv("SERVICE_ACCOUNT_JSON", "").strip()
+SESSION_SECRET       = os.getenv("SESSION_SECRET", "")  # optional/unused
 
 if not DISCORD_TOKEN:
-    raise RuntimeError("Missing DISCORD_TOKEN in .env")
+    raise RuntimeError("Missing DISCORD_TOKEN in Replit Secrets")
 if not SPREADSHEET_ID:
-    raise RuntimeError("Missing SPREADSHEET_ID in .env")
+    raise RuntimeError("Missing SPREADSHEET_ID in Replit Secrets")
 
 GUILD_ID  = int(GUILD_ID_ENV) if GUILD_ID_ENV.isdigit() else 0
 guild_obj = discord.Object(id=GUILD_ID) if GUILD_ID else None
 
+def get_service_account_keyfile_path():
+    """
+    On Replit, we read the full JSON from SERVICE_ACCOUNT_JSON and write it to /tmp.
+    Falls back to local service_account.json if present (for local dev).
+    """
+    if SERVICE_ACCOUNT_JSON:
+        tmp_path = "/tmp/service_account.json"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(SERVICE_ACCOUNT_JSON)
+        return tmp_path
+    if os.path.exists("service_account.json"):
+        return "service_account.json"
+    raise RuntimeError("No service account credentials found. Set SERVICE_ACCOUNT_JSON in Secrets.")
+
 # ---------- GOOGLE SHEETS AUTH ----------
-# Sheets scope is sufficient; Drive scope optional. Keep both if you like.
 scope = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
-creds = ServiceAccountCredentials.from_json_keyfile_name("service_account.json", scope)
+keyfile_path = get_service_account_keyfile_path()
+creds = ServiceAccountCredentials.from_json_keyfile_name(keyfile_path, scope)
 gc = gspread.authorize(creds)
 
-# Open spreadsheet by ID (avoids title mismatches)
+# Open spreadsheet by ID (avoids Drive name lookup)
 sh = gc.open_by_key(SPREADSHEET_ID)
 print("Worksheets available:", [w.title for w in sh.worksheets()])
 
@@ -111,10 +132,9 @@ async def journal(
     price_close: float | None = None
 ):
     try:
-        # Respond immediately so the token stays valid while we do I/O
+        # Defer immediately so token doesn't expire while we hit Sheets
         await interaction.response.defer(ephemeral=True, thinking=True)
 
-        # Do the slow work (Google Sheets)
         append_journal_row(
             user=f"{interaction.user.name}#{interaction.user.discriminator}",
             message_id=interaction.id,
@@ -129,31 +149,45 @@ async def journal(
             f"✅ Journaled {position.value.upper()} {ticker.upper()} | open @ {price_open}{suffix}",
             ephemeral=True
         )
-
     except Exception as e:
-        # If we've already deferred, use followup; otherwise send initial response
         if interaction.response.is_done():
             await interaction.followup.send(f"❌ Failed: {e}", ephemeral=True)
         else:
             await interaction.response.send_message(f"❌ Failed: {e}", ephemeral=True)
 
-# Simple test command to verify slash commands are synced
 @tree.command(name="ping", description="Test command visibility")
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message("pong", ephemeral=True)
 
+# --- Tiny web server so Replit gives us a URL (useful for uptime pings)
+async def start_web_server():
+    async def ok(_):
+        return web.Response(text="ok")
+    app = web.Application()
+    app.router.add_get("/", ok)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+    await site.start()
+    print("Web server running on /")
+
 @client.event
 async def on_ready():
-    # Sync slash commands to your guild for instant availability if GUILD_ID is set,
-    # otherwise do a global sync (can take a while to appear).
+    # Start the tiny web server
+    try:
+        await start_web_server()
+    except Exception as e:
+        print("Web server failed:", e)
+
+    # Sync slash commands (guild = instant, global can take longer)
     try:
         if guild_obj:
             synced = await tree.sync(guild=guild_obj)
-            where = f"guild {GUILD_ID}"
+            where = f"guild {guild_obj.id}"
         else:
             synced = await tree.sync()
             where = "global"
-        print(f"Logged in as {client.user} | synced {len(synced)} commands to {where}")
+        print(f"Logged in as {client.user} | synced {len(synced)} command(s) to {where}")
         print("Commands:", [c.name for c in synced])
     except Exception as e:
         print("Slash command sync failed:", e)
